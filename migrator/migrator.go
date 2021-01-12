@@ -1,6 +1,7 @@
 package migrator
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"reflect"
@@ -15,17 +16,40 @@ import (
 // Migrator m struct
 type Migrator struct {
 	Config
+	MigratorStatement bytes.Buffer
 }
 
 // Config schema config
 type Config struct {
 	CreateIndexAfterCreateTable bool
 	DB                          *gorm.DB
+	ProxyDB                     *gorm.DB
+	DryRun                      bool
 	gorm.Dialector
 }
 
 type GormDataTypeInterface interface {
 	GormDBDataType(*gorm.DB, *schema.Field) string
+}
+
+func (m Migrator) initProxy() {
+	isDryRun := m.DryRun
+	if m.ProxyDB == nil {
+		if isDryRun {
+			m.ProxyDB = m.DB.Session(&gorm.Session{DryRun: true})
+		} else {
+			m.ProxyDB = m.DB
+		}
+	}
+}
+
+func (m Migrator) writeStatement(statement *gorm.Statement) {
+	m.MigratorStatement.WriteString(statement.Statement.SQL.String())
+	m.MigratorStatement.WriteString("; /*\n*/")
+}
+
+func (m Migrator) SetDryRun(isDryRun bool) {
+	m.DryRun = isDryRun
 }
 
 func (m Migrator) RunWithValue(value interface{}, fc func(*gorm.Statement) error) error {
@@ -79,8 +103,14 @@ func (m Migrator) FullDataTypeOf(field *schema.Field) (expr clause.Expr) {
 	return
 }
 
+func (m Migrator) SQL() *bytes.Buffer {
+	return &m.MigratorStatement
+}
+
 // AutoMigrate
 func (m Migrator) AutoMigrate(values ...interface{}) error {
+	m.MigratorStatement.Reset()
+
 	for _, value := range m.ReorderModels(values, true) {
 		tx := m.DB.Session(&gorm.Session{NewDB: true})
 		if !tx.Migrator().HasTable(value) {
@@ -153,8 +183,10 @@ func (m Migrator) AutoMigrate(values ...interface{}) error {
 }
 
 func (m Migrator) CreateTable(values ...interface{}) error {
+	var isDryRun = m.DryRun
+
 	for _, value := range m.ReorderModels(values, false) {
-		tx := m.DB.Session(&gorm.Session{NewDB: true})
+		tx := m.DB.Session(&gorm.Session{NewDB: true, DryRun: isDryRun})
 		if err := m.RunWithValue(value, func(stmt *gorm.Statement) (errr error) {
 			var (
 				createTableSQL          = "CREATE TABLE ? ("
@@ -172,7 +204,7 @@ func (m Migrator) CreateTable(values ...interface{}) error {
 
 			if !hasPrimaryKeyInDataType && len(stmt.Schema.PrimaryFields) > 0 {
 				createTableSQL += "PRIMARY KEY ?,"
-				primaryKeys := []interface{}{}
+				var primaryKeys []interface{}
 				for _, field := range stmt.Schema.PrimaryFields {
 					primaryKeys = append(primaryKeys, clause.Column{Name: field.DBName})
 				}
@@ -225,7 +257,13 @@ func (m Migrator) CreateTable(values ...interface{}) error {
 				createTableSQL += fmt.Sprint(tableOption)
 			}
 
-			errr = tx.Exec(createTableSQL, values...).Error
+			statement := tx.Exec(createTableSQL, values...)
+
+			if isDryRun {
+				m.writeStatement(statement.Statement)
+			} else {
+				errr = statement.Error
+			}
 			return errr
 		}); err != nil {
 			return err
@@ -235,11 +273,17 @@ func (m Migrator) CreateTable(values ...interface{}) error {
 }
 
 func (m Migrator) DropTable(values ...interface{}) error {
+	isDryRun := m.DryRun
 	values = m.ReorderModels(values, false)
 	for i := len(values) - 1; i >= 0; i-- {
-		tx := m.DB.Session(&gorm.Session{NewDB: true})
+		tx := m.DB.Session(&gorm.Session{NewDB: true, DryRun: isDryRun})
 		if err := m.RunWithValue(values[i], func(stmt *gorm.Statement) error {
-			return tx.Exec("DROP TABLE IF EXISTS ?", m.CurrentTable(stmt)).Error
+			statement := tx.Exec("DROP TABLE IF EXISTS ?", m.CurrentTable(stmt))
+			if isDryRun {
+				m.writeStatement(statement.Statement)
+				return nil
+			}
+			return statement.Error
 		}); err != nil {
 			return err
 		}
@@ -250,7 +294,7 @@ func (m Migrator) DropTable(values ...interface{}) error {
 func (m Migrator) HasTable(value interface{}) bool {
 	var count int64
 
-	m.RunWithValue(value, func(stmt *gorm.Statement) error {
+	_ = m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		currentDatabase := m.DB.Migrator().CurrentDatabase()
 		return m.DB.Raw("SELECT count(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ? AND table_type = ?", currentDatabase, stmt.Table, "BASE TABLE").Row().Scan(&count)
 	})
@@ -260,6 +304,8 @@ func (m Migrator) HasTable(value interface{}) bool {
 
 func (m Migrator) RenameTable(oldName, newName interface{}) error {
 	var oldTable, newTable interface{}
+	var isDryRun = m.DryRun
+
 	if v, ok := oldName.(string); ok {
 		oldTable = clause.Table{Name: v}
 	} else {
@@ -282,42 +328,76 @@ func (m Migrator) RenameTable(oldName, newName interface{}) error {
 		}
 	}
 
-	return m.DB.Exec("ALTER TABLE ? RENAME TO ?", oldTable, newTable).Error
+	m.initProxy()
+
+	statement := m.ProxyDB.Exec("ALTER TABLE ? RENAME TO ?", oldTable, newTable)
+
+	if isDryRun {
+		m.writeStatement(statement.Statement)
+		return nil
+	}
+
+	return statement.Error
 }
 
 func (m Migrator) AddColumn(value interface{}, field string) error {
+	m.initProxy()
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		if field := stmt.Schema.LookUpField(field); field != nil {
-			return m.DB.Exec(
+
+			statement := m.ProxyDB.Exec(
 				"ALTER TABLE ? ADD ? ?",
 				m.CurrentTable(stmt), clause.Column{Name: field.DBName}, m.DB.Migrator().FullDataTypeOf(field),
-			).Error
+			)
+
+			if !m.DryRun {
+				return statement.Error
+			}
+
+			m.writeStatement(statement.Statement)
+			return nil
 		}
 		return fmt.Errorf("failed to look up field with name: %s", field)
 	})
 }
 
 func (m Migrator) DropColumn(value interface{}, name string) error {
+	m.initProxy()
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		if field := stmt.Schema.LookUpField(name); field != nil {
 			name = field.DBName
 		}
 
-		return m.DB.Exec(
+		statement := m.ProxyDB.Exec(
 			"ALTER TABLE ? DROP COLUMN ?", m.CurrentTable(stmt), clause.Column{Name: name},
-		).Error
+		)
+
+		if !m.DryRun {
+			return statement.Error
+		}
+
+		m.writeStatement(statement.Statement)
+
+		return nil
 	})
 }
 
 func (m Migrator) AlterColumn(value interface{}, field string) error {
+	m.initProxy()
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		if field := stmt.Schema.LookUpField(field); field != nil {
 			fileType := clause.Expr{SQL: m.DataTypeOf(field)}
-			return m.DB.Exec(
+			statement := m.ProxyDB.Exec(
 				"ALTER TABLE ? ALTER COLUMN ? TYPE ?",
 				m.CurrentTable(stmt), clause.Column{Name: field.DBName}, fileType,
-			).Error
+			)
 
+			if m.DryRun {
+				m.writeStatement(statement.Statement)
+				return nil
+			}
+
+			return statement.Error
 		}
 		return fmt.Errorf("failed to look up field with name: %s", field)
 	})
@@ -325,7 +405,7 @@ func (m Migrator) AlterColumn(value interface{}, field string) error {
 
 func (m Migrator) HasColumn(value interface{}, field string) bool {
 	var count int64
-	m.RunWithValue(value, func(stmt *gorm.Statement) error {
+	_ = m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		currentDatabase := m.DB.Migrator().CurrentDatabase()
 		name := field
 		if field := stmt.Schema.LookUpField(field); field != nil {
@@ -342,6 +422,7 @@ func (m Migrator) HasColumn(value interface{}, field string) bool {
 }
 
 func (m Migrator) RenameColumn(value interface{}, oldName, newName string) error {
+	m.initProxy()
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		if field := stmt.Schema.LookUpField(oldName); field != nil {
 			oldName = field.DBName
@@ -351,10 +432,17 @@ func (m Migrator) RenameColumn(value interface{}, oldName, newName string) error
 			newName = field.DBName
 		}
 
-		return m.DB.Exec(
+		statement := m.ProxyDB.Exec(
 			"ALTER TABLE ? RENAME COLUMN ? TO ?",
 			m.CurrentTable(stmt), clause.Column{Name: oldName}, clause.Column{Name: newName},
-		).Error
+		)
+
+		if m.DryRun {
+			m.writeStatement(statement.Statement)
+			return nil
+		}
+
+		return statement.Error
 	})
 }
 
@@ -450,19 +538,35 @@ func buildConstraint(constraint *schema.Constraint) (sql string, results []inter
 }
 
 func (m Migrator) CreateConstraint(value interface{}, name string) error {
+	m.initProxy()
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		checkConstraints := stmt.Schema.ParseCheckConstraints()
 		if chk, ok := checkConstraints[name]; ok {
-			return m.DB.Exec(
+			statement := m.ProxyDB.Exec(
 				"ALTER TABLE ? ADD CONSTRAINT ? CHECK (?)",
 				m.CurrentTable(stmt), clause.Column{Name: chk.Name}, clause.Expr{SQL: chk.Constraint},
-			).Error
+			)
+
+			if m.DryRun {
+				m.writeStatement(statement.Statement)
+				return nil
+			}
+
+			return statement.Error
 		}
 
 		for _, rel := range stmt.Schema.Relationships.Relations {
 			if constraint := rel.ParseConstraint(); constraint != nil && constraint.Name == name {
 				sql, values := buildConstraint(constraint)
-				return m.DB.Exec("ALTER TABLE ? ADD "+sql, append([]interface{}{m.CurrentTable(stmt)}, values...)...).Error
+				statement := m.ProxyDB.Exec("ALTER TABLE ? ADD "+sql,
+					append([]interface{}{m.CurrentTable(stmt)}, values...)...)
+
+				if m.DryRun {
+					m.writeStatement(statement.Statement)
+					return nil
+				}
+
+				return statement.Error
 			}
 		}
 
@@ -488,17 +592,26 @@ func (m Migrator) CreateConstraint(value interface{}, name string) error {
 }
 
 func (m Migrator) DropConstraint(value interface{}, name string) error {
+	m.initProxy()
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
-		return m.DB.Exec(
+
+		statement := m.ProxyDB.Exec(
 			"ALTER TABLE ? DROP CONSTRAINT ?",
 			m.CurrentTable(stmt), clause.Column{Name: name},
-		).Error
+		)
+
+		if m.DryRun {
+			m.writeStatement(statement.Statement)
+			return nil
+		}
+
+		return statement.Error
 	})
 }
 
 func (m Migrator) HasConstraint(value interface{}, name string) bool {
 	var count int64
-	m.RunWithValue(value, func(stmt *gorm.Statement) error {
+	_ = m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		currentDatabase := m.DB.Migrator().CurrentDatabase()
 		return m.DB.Raw(
 			"SELECT count(*) FROM INFORMATION_SCHEMA.table_constraints WHERE constraint_schema = ? AND table_name = ? AND constraint_name = ?",
@@ -535,6 +648,7 @@ type BuildIndexOptionsInterface interface {
 }
 
 func (m Migrator) CreateIndex(value interface{}, name string) error {
+	m.initProxy()
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		if idx := stmt.Schema.LookIndex(name); idx != nil {
 			opts := m.DB.Migrator().(BuildIndexOptionsInterface).BuildIndexOptions(idx.Fields, stmt)
@@ -554,7 +668,14 @@ func (m Migrator) CreateIndex(value interface{}, name string) error {
 				createIndexSQL += " " + idx.Option
 			}
 
-			return m.DB.Exec(createIndexSQL, values...).Error
+			statement := m.ProxyDB.Exec(createIndexSQL, values...)
+
+			if m.DryRun {
+				m.writeStatement(statement.Statement)
+				return nil
+			}
+
+			return statement.Error
 		}
 
 		return fmt.Errorf("failed to create index with name %v", name)
@@ -562,18 +683,26 @@ func (m Migrator) CreateIndex(value interface{}, name string) error {
 }
 
 func (m Migrator) DropIndex(value interface{}, name string) error {
+	m.initProxy()
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		if idx := stmt.Schema.LookIndex(name); idx != nil {
 			name = idx.Name
 		}
 
-		return m.DB.Exec("DROP INDEX ? ON ?", clause.Column{Name: name}, m.CurrentTable(stmt)).Error
+		statement := m.ProxyDB.Exec("DROP INDEX ? ON ?", clause.Column{Name: name}, m.CurrentTable(stmt))
+
+		if m.DryRun {
+			m.writeStatement(statement.Statement)
+			return nil
+		}
+
+		return statement.Error
 	})
 }
 
 func (m Migrator) HasIndex(value interface{}, name string) bool {
 	var count int64
-	m.RunWithValue(value, func(stmt *gorm.Statement) error {
+	_ = m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		currentDatabase := m.DB.Migrator().CurrentDatabase()
 		if idx := stmt.Schema.LookIndex(name); idx != nil {
 			name = idx.Name
@@ -589,16 +718,24 @@ func (m Migrator) HasIndex(value interface{}, name string) bool {
 }
 
 func (m Migrator) RenameIndex(value interface{}, oldName, newName string) error {
+	m.initProxy()
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
-		return m.DB.Exec(
+		statement := m.ProxyDB.Exec(
 			"ALTER TABLE ? RENAME INDEX ? TO ?",
 			m.CurrentTable(stmt), clause.Column{Name: oldName}, clause.Column{Name: newName},
-		).Error
+		)
+
+		if m.DryRun {
+			m.writeStatement(statement.Statement)
+			return nil
+		}
+
+		return statement.Error
 	})
 }
 
 func (m Migrator) CurrentDatabase() (name string) {
-	m.DB.Raw("SELECT DATABASE()").Row().Scan(&name)
+	_ = m.DB.Raw("SELECT DATABASE()").Row().Scan(&name)
 	return
 }
 

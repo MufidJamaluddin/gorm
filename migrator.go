@@ -1,6 +1,8 @@
 package gorm
 
 import (
+	"bytes"
+	"errors"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/schema"
 )
@@ -10,9 +12,29 @@ func (db *DB) Migrator() Migrator {
 	return db.Dialector.Migrator(db.Session(&Session{}))
 }
 
+func (db *DB) DryMigrator() (DryMigrator, error) {
+	migrator := db.Migrator()
+	if dryMigrator, ok := migrator.(DryMigrator); ok {
+		return dryMigrator, nil
+	}
+	return nil, errors.New("the current driver doesn't support DryMigrator")
+}
+
 // AutoMigrate run auto migration for given models
 func (db *DB) AutoMigrate(dst ...interface{}) error {
 	return db.Migrator().AutoMigrate(dst...)
+}
+
+func (db *DB) DryMigrate(dst ...interface{}) (sql string, err error) {
+	var migrator DryMigrator
+	migrator, err = db.DryMigrator()
+	if err != nil {
+		return
+	}
+	err = migrator.AutoMigrate(dst...)
+	sql = migrator.SQL().String()
+	migrator.SQL().Reset()
+	return
 }
 
 // ViewOption view option
@@ -67,4 +89,10 @@ type Migrator interface {
 	DropIndex(dst interface{}, name string) error
 	HasIndex(dst interface{}, name string) bool
 	RenameIndex(dst interface{}, oldName, newName string) error
+}
+
+type DryMigrator interface {
+	Migrator
+	SQL() *bytes.Buffer
+	SetDryRun(dryRun bool)
 }
